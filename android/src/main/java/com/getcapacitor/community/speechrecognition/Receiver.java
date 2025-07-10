@@ -5,9 +5,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.speech.RecognizerIntent;
+
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PluginCall;
+
+import java.util.ArrayList;
 import java.util.List;
 
 public class Receiver extends BroadcastReceiver implements Constants {
@@ -16,7 +19,7 @@ public class Receiver extends BroadcastReceiver implements Constants {
 
     private List<String> supportedLanguagesList;
     private String languagePref;
-    private PluginCall call;
+    private final PluginCall call;
 
     public Receiver(PluginCall call) {
         super();
@@ -26,17 +29,27 @@ public class Receiver extends BroadcastReceiver implements Constants {
     @Override
     public void onReceive(Context context, Intent intent) {
         Bundle extras = getResultExtras(true);
+        if (extras != null) {
 
-        if (extras.containsKey(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE)) {
-            languagePref = extras.getString(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE);
-        }
+            if (extras.containsKey(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE)) {
+                languagePref = extras.getString(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE);
+            }
 
-        if (extras.containsKey(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES)) {
-            supportedLanguagesList = extras.getStringArrayList(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES);
+            if (extras.containsKey("com.google.recognition.extra.OFFLINE_AVAILABLE_LANGUAGES")) {
+                byte[] data = extras.getByteArray(
+                        "com.google.recognition.extra.OFFLINE_AVAILABLE_LANGUAGES");
 
-            JSArray languagesList = new JSArray(supportedLanguagesList);
-            call.resolve(new JSObject().put("languages", languagesList));
-            return;
+                if (data != null) {
+                    supportedLanguagesList = extractPrintableStrings(data);
+
+                    JSArray languagesArray = new JSArray(supportedLanguagesList);
+                    JSObject result = new JSObject();
+                    result.put("languages", languagesArray);
+                    call.resolve(result);
+                    return;
+                }
+            }
+
         }
 
         call.reject(ERROR);
@@ -48,5 +61,34 @@ public class Receiver extends BroadcastReceiver implements Constants {
 
     public String getLanguagePreference() {
         return languagePref;
+    }
+
+    private static ArrayList<String> extractPrintableStrings(byte[] data) {
+        ArrayList<String> result = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+
+        for (byte b : data) {
+            char c = (char) (b & 0xFF); // unsigned
+
+            if (isPrintableAscii(c)) {
+                current.append(c);
+            } else {
+                if (current.length() >= 4) {
+                    result.add(current.toString());
+                }
+                current.setLength(0);
+            }
+        }
+
+        // Append last string if valid
+        if (current.length() >= 4) {
+            result.add(current.toString());
+        }
+
+        return result;
+    }
+
+    private static boolean isPrintableAscii(char c) {
+        return c >= 32 && c <= 126; // visible chars
     }
 }
