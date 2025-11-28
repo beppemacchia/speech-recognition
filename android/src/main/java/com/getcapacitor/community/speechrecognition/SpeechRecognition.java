@@ -1,439 +1,498 @@
 package com.getcapacitor.community.speechrecognition;
 
 import android.Manifest;
-import android.app.Activity;
-import android.content.Intent;
-import android.os.Build;
-import android.os.Bundle;
+import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
-import android.speech.RecognitionListener;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
-
-import androidx.activity.result.ActivityResult;
-
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Logger;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
-import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
-import com.getcapacitor.annotation.PermissionCallback;
-
 import org.json.JSONArray;
+import org.json.JSONObject;
+import org.vosk.Model;
+import org.vosk.Recognizer;
+import org.vosk.android.RecognitionListener;
+import org.vosk.android.SpeechService;
+import java.io.File;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.List;
-import java.util.Locale;
-
-@CapacitorPlugin(permissions = {@Permission(strings = {Manifest.permission.RECORD_AUDIO}, alias = SpeechRecognition.SPEECH_RECOGNITION)})
+@CapacitorPlugin(
+        permissions = { @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = SpeechRecognition.SPEECH_RECOGNITION) }
+)
 public class SpeechRecognition extends Plugin implements Constants {
 
-  private static final String TAG = "SpeechRecognition";
+  public static final String TAG = "SpeechRecognition";
   private static final String LISTENING_EVENT = "listeningState";
   static final String SPEECH_RECOGNITION = "speechRecognition";
-  private Receiver languageReceiver;
-  private SpeechRecognizer speechRecognizer;
-  private boolean isListening = false;
-  // TODO set dynamically from js
-  private static final int TIMEOUT_SPEECH = 5000;
+  private static final float SAMPLE_RATE = 16000.0f;
+
+  private Map<String, Model> models = new HashMap<>();
+  private Model currentModel;
+  private SpeechService speechService;
+  private final ReentrantLock lock = new ReentrantLock();
+  private boolean listening = false;
+  private boolean isModelLoaded = false;
+  private String lastPartialResult = "";
+  private String accumulatedText = "";
+  private Handler mainHandler;
+  private String currentLanguage = "en-GB";
 
   @Override
   public void load() {
     super.load();
-    getActivity().runOnUiThread(() -> {
-      if (isSpeechRecognitionAvailable()) {
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(getContext());
-        speechRecognizer.setRecognitionListener(new SpeechRecognitionListener());
-        Logger.info(getLogTag(), "Instantiated SpeechRecognizer in load()");
-      } else {
-        Logger.error("Speech recognition not available on this device");
+    mainHandler = new Handler(Looper.getMainLooper());
+
+    // Load models in background
+    new Thread(() -> {
+      try {
+        loadModelsFromAssets();
+      } catch (Exception e) {
+        Logger.error(getLogTag() + " Error loading models: " + e.getMessage(), e);
       }
-    });
+    }).start();
+  }
+
+  private void loadModelsFromAssets() {
+    Context context = bridge.getContext();
+
+    try {
+      // Load english model from assets
+      String enModelPath = getModelPath(context, "vosk-model-small-en-gb-0.15");
+      if (enModelPath != null) {
+        Model enModel = new Model(enModelPath);
+        models.put("en-GB", enModel);
+        Logger.info(getLogTag(), "English model loaded from assets");
+      }
+
+      // Load italian model from assets
+      String itModelPath = getModelPath(context, "vosk-model-small-it-0.22");
+      if (itModelPath != null) {
+        Model itModel = new Model(itModelPath);
+        models.put("it-IT", itModel);
+        Logger.info(getLogTag(), "Italian model loaded from assets");
+      }
+
+      // Set english model as default
+      currentModel = models.get("en-GB");
+      if (currentModel != null) {
+        isModelLoaded = true;
+        Logger.info(getLogTag(), "Models loaded successfully");
+      } else {
+        Logger.error(getLogTag() + " No models available");
+      }
+
+    } catch (Exception e) {
+      Logger.error(getLogTag() + " Failed to load models: " + e.getMessage(), e);
+      isModelLoaded = false;
+    }
+  }
+
+  private String getModelPath(Context context, String modelName) {
+    try {
+      // Models are in assets/models/
+      File modelsDir = new File(context.getFilesDir(), "models");
+      File modelDir = new File(modelsDir, modelName);
+
+      // If the model has not yet been copied from assets, copy it
+      if (!modelDir.exists()) {
+        copyModelFromAssets(context, modelName, modelDir);
+      }
+
+      // Verify that the model is valid
+      if (modelDir.exists() && isValidModelDirectory(modelDir)) {
+        return modelDir.getAbsolutePath();
+      }
+
+      return null;
+    } catch (Exception e) {
+      Logger.error(getLogTag() + " Error getting model path: " + e.getMessage(), e);
+      return null;
+    }
+  }
+
+  private void copyModelFromAssets(Context context, String modelName, File destDir) throws IOException {
+    String assetsPath = "models/" + modelName;
+    destDir.mkdirs();
+
+    try {
+      String[] files = context.getAssets().list(assetsPath);
+      if (files == null || files.length == 0) {
+        Logger.error(getLogTag() + " Model not found in assets: " + assetsPath);
+        return;
+      }
+
+      copyAssetFolder(context, assetsPath, destDir.getAbsolutePath());
+      Logger.info(getLogTag(), "Model copied from assets: " + modelName);
+
+    } catch (IOException e) {
+      Logger.error(getLogTag() + " Failed to copy model from assets: " + e.getMessage(), e);
+      throw e;
+    }
+  }
+
+  private void copyAssetFolder(Context context, String srcPath, String destPath) throws IOException {
+    String[] assets = context.getAssets().list(srcPath);
+    if (assets == null) return;
+
+    File destDir = new File(destPath);
+    if (!destDir.exists()) {
+      destDir.mkdirs();
+    }
+
+    for (String asset : assets) {
+      String fullSrcPath = srcPath + "/" + asset;
+      String fullDestPath = destPath + "/" + asset;
+
+      // Controlla se è una cartella
+      String[] subAssets = context.getAssets().list(fullSrcPath);
+      if (subAssets != null && subAssets.length > 0) {
+        // È una cartella, ricorsione
+        copyAssetFolder(context, fullSrcPath, fullDestPath);
+      } else {
+        // È un file, copialo
+        copyAssetFile(context, fullSrcPath, fullDestPath);
+      }
+    }
+  }
+
+  private void copyAssetFile(Context context, String srcPath, String destPath) throws IOException {
+    java.io.InputStream in = null;
+    java.io.OutputStream out = null;
+
+    try {
+      in = context.getAssets().open(srcPath);
+      File outFile = new File(destPath);
+      out = new java.io.FileOutputStream(outFile);
+
+      byte[] buffer = new byte[8192];
+      int read;
+      while ((read = in.read(buffer)) != -1) {
+        out.write(buffer, 0, read);
+      }
+    } finally {
+      if (in != null) in.close();
+      if (out != null) out.close();
+    }
+  }
+
+  private boolean isValidModelDirectory(File dir) {
+    // Verify that the directory contains the necessary files for a Vosk model
+    File amFile = new File(dir, "am/final.mdl");
+    File graphFile = new File(dir, "graph/HCLr.fst");
+
+    return amFile.exists() && graphFile.exists();
+  }
+
+  private String getLanguageCode(String language) {
+    if (language == null) return "en-GB";
+
+    // Normalize the language code
+    if (language.startsWith("en")) return "en-GB";
+    if (language.startsWith("it")) return "it-IT";
+
+    return "en-GB"; // Default
   }
 
   @PluginMethod
   public void available(PluginCall call) {
-    boolean isAvailable = isSpeechRecognitionAvailable();
-    Logger.info(getLogTag(), "Called for available(): " + isAvailable);
-    JSObject ret = new JSObject();
-    ret.put("available", isAvailable);
-    call.resolve(ret);
+    Logger.info(getLogTag(), "Called for available(): " + isModelLoaded);
+    JSObject result = new JSObject();
+    result.put("available", isModelLoaded);
+    result.put("languagesLoaded", new JSArray(models.keySet()));
+    call.resolve(result);
   }
 
   @PluginMethod
   public void start(PluginCall call) {
-    if (speechRecognizer == null) {
-      call.reject("Speech recognition not available");
+    if (!isModelLoaded) {
+      call.reject("Models not loaded yet. Please wait.");
       return;
     }
 
-    if (getPermissionState(SpeechRecognition.SPEECH_RECOGNITION) != com.getcapacitor.PermissionState.GRANTED) {
-      call.reject("Microphone permission required");
+    if (getPermissionState(SPEECH_RECOGNITION) != PermissionState.GRANTED) {
+      call.reject(MISSING_PERMISSION);
       return;
     }
 
-    if (isListening) {
-      call.reject("Already listening");
-      return;
-    }
+    String language = call.getString("language", "it-IT");
+    boolean partialResults = call.getBoolean("partialResults", true);
 
-    String language = call.getString("language", Locale.getDefault().toString());
-    int maxResults = call.getInt("maxResults", MAX_RESULTS);
-    
-    String prompt = call.getString("prompt", null);
-    boolean partialResults = Boolean.TRUE.equals(call.getBoolean("partialResults", false));
-    boolean showPopup = Boolean.TRUE.equals(call.getBoolean("popup", false));
-
-    Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-
-    intent.putExtra(RecognizerIntent.ACTION_RECOGNIZE_SPEECH, RecognizerIntent.EXTRA_PREFER_OFFLINE);
-    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language);
-    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language);
-    intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, maxResults);
-    intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getActivity().getPackageName());
-    intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partialResults);
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-      intent.putExtra(RecognizerIntent.EXTRA_ENABLE_FORMATTING, RecognizerIntent.FORMATTING_OPTIMIZE_QUALITY);
-    }
-    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, TIMEOUT_SPEECH);
-    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, TIMEOUT_SPEECH);
-
-
-    if (prompt != null) {
-      intent.putExtra(RecognizerIntent.EXTRA_PROMPT, prompt);
-    }
-
-    getActivity().runOnUiThread(() -> {
-
-      if (speechRecognizer != null) {
-        speechRecognizer.cancel();
-        speechRecognizer.destroy();
-        speechRecognizer = null;
+    // Change model if necessary
+    String langCode = getLanguageCode(language);
+    if (!langCode.equals(currentLanguage)) {
+      Model newModel = models.get(langCode);
+      if (newModel != null) {
+        currentModel = newModel;
+        currentLanguage = langCode;
+        Logger.info(getLogTag(), "Switched to language: " + langCode);
+      } else {
+        Logger.warn(getLogTag(), "Model not available for: " + langCode + ", using current");
       }
+    }
 
-      speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
-      SpeechRecognitionListener listener = new SpeechRecognitionListener();
-      listener.setCall(call);
-      listener.setPartialResults(partialResults);
-      speechRecognizer.setRecognitionListener(listener);
-
-      try {
-        if (showPopup) {
-          startActivityForResult(call, intent, "listeningResult");
-        } else {
-          isListening = true;
-          speechRecognizer.startListening(intent);
-          if (partialResults) {
-            call.resolve();
-          }
-        }
-      } catch (Exception ex) {
-        call.reject(ex.getMessage());
-      }
-
-
-    });
+    beginListening(partialResults, call);
   }
 
   @PluginMethod
-  public void stop(PluginCall call) {
-    getActivity().runOnUiThread(() -> {
-      if (speechRecognizer != null && isListening) {
-        speechRecognizer.stopListening();
-        isListening = false;
-      }
-
-      JSObject ret = new JSObject();
-      ret.put("stopped", true);
-      call.resolve(ret);
-    });
+  public void stop(final PluginCall call) {
+    try {
+      stopListening();
+      call.resolve();
+    } catch (Exception ex) {
+      call.reject(ex.getLocalizedMessage());
+    }
   }
-
-
-  @PluginMethod
-  public void getSupportedLanguages(PluginCall call) {
-    if (languageReceiver == null) {
-      languageReceiver = new Receiver(call);
-    }
-
-    List<String> supportedLanguages = languageReceiver.getSupportedLanguages();
-    if (supportedLanguages != null) {
-      JSONArray languages = new JSONArray(supportedLanguages);
-      call.resolve(new JSObject().put("languages", languages));
-      return;
-    }
-
-    Intent detailsIntent = new Intent(RecognizerIntent.ACTION_GET_LANGUAGE_DETAILS);
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      detailsIntent.setPackage("com.google.android.googlequicksearchbox");
-    }
-    bridge.getActivity().sendOrderedBroadcast(detailsIntent, null, languageReceiver, null, Activity.RESULT_OK, null, null);
-  }
-
 
   @PluginMethod
   public void isListening(PluginCall call) {
-    call.resolve(new JSObject().put("listening", isListening));
+    call.resolve(new JSObject().put("listening", this.listening));
   }
 
   @PluginMethod
-  public void checkPermissions(PluginCall call) {
-    super.checkPermissions(call);
-  }
-
-  @PluginMethod
-  public void requestPermissions(PluginCall call) {
-    requestPermissionForAlias(SpeechRecognition.SPEECH_RECOGNITION, call, "permissionsCallback");
-  }
-
-  @PermissionCallback
-  private void permissionsCallback(PluginCall call) {
-    this.checkPermissions(call);
-  }
-
-  @ActivityCallback
-  private void listeningResult(PluginCall call, ActivityResult result) {
-    if (call == null) {
-      return;
+  public void getSupportedLanguages(PluginCall call) {
+    JSONArray languages = new JSONArray();
+    for (String lang : models.keySet()) {
+      languages.put(lang);
     }
+    call.resolve(new JSObject().put("languages", languages));
+  }
 
-    boolean partialResults = Boolean.TRUE.equals(call.getBoolean("partialResults", false));
-    if (partialResults) {
-      call.resolve();
-    }
+  private void beginListening(boolean partialResults, PluginCall call) {
+    Logger.info(getLogTag(), "Beginning continuous listening with Vosk");
 
-    int resultCode = result.getResultCode();
-    if (resultCode == Activity.RESULT_OK && result.getData() != null) {
-      try {
-        ArrayList<String> matchesList = result.getData().getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
-        JSObject resultObj = new JSObject();
-        resultObj.put("matches", new JSArray(matchesList));
-        if (partialResults) {
-          notifyListeners("partialResults", resultObj);
-        } else {
-          call.resolve(resultObj);
+    try {
+      lock.lock();
+
+      if (speechService != null) {
+        speechService.stop();
+        speechService.shutdown();
+        speechService = null;
+      }
+
+      // Reset accumulated text when starting new session
+      accumulatedText = "";
+      lastPartialResult = "";
+
+      if (currentModel == null) {
+        throw new Exception("No model available");
+      }
+
+      Recognizer recognizer = new Recognizer(currentModel, SAMPLE_RATE);
+
+      // Enable partial results if required
+      if (partialResults) {
+        recognizer.setMaxAlternatives(1);
+        recognizer.setWords(true);
+      }
+
+      speechService = new SpeechService(recognizer, SAMPLE_RATE);
+
+      speechService.startListening(new RecognitionListener() {
+        @Override
+        public void onPartialResult(String hypothesis) {
+          if (hypothesis == null || hypothesis.isEmpty()) return;
+
+          try {
+            JSONObject json = new JSONObject(hypothesis);
+            String partial = json.optString("partial", "");
+
+            if (!partial.isEmpty() && !partial.equals(lastPartialResult)) {
+              lastPartialResult = partial;
+
+              mainHandler.post(() -> {
+                JSObject ret = new JSObject();
+                JSArray matches = new JSArray();
+
+                // Combines the accumulated text with the current partial result
+                String fullText = accumulatedText.isEmpty()
+                        ? partial
+                        : accumulatedText + " " + partial;
+
+                matches.put(fullText);
+                ret.put("matches", matches);
+                notifyListeners("partialResults", ret);
+              });
+            }
+          } catch (Exception e) {
+            Logger.error(getLogTag() + " Error parsing partial result: " + e.getMessage());
+          }
         }
 
-      } catch (Exception ex) {
-        call.reject(ex.getMessage());
-      }
-    } else {
-      call.reject(Integer.toString(resultCode));
-    }
+        @Override
+        public void onResult(String hypothesis) {
+          if (hypothesis == null || hypothesis.isEmpty()) return;
 
-    isListening = false;
-  }
+          try {
+            JSONObject json = new JSONObject(hypothesis);
+            // Navigate the structure: alternatives[0].text
+            String pText = "";
+            if (json.has("alternatives")) {
+              JSONArray alternatives = json.getJSONArray("alternatives");
+              if (alternatives.length() > 0) {
+                JSONObject firstAlternative = alternatives.getJSONObject(0);
+                pText = firstAlternative.optString("text", "");
+              }
+            }
 
-  private boolean isSpeechRecognitionAvailable() {
-    return SpeechRecognizer.isRecognitionAvailable(bridge.getContext());
-  }
+            String text = pText;
 
-  @PluginMethod
-  public void cancel(PluginCall call) {
-    getActivity().runOnUiThread(() -> {
-      if (speechRecognizer != null && isListening) {
-        speechRecognizer.cancel();
-        isListening = false;
-      }
+            if (!text.isEmpty()) {
+              mainHandler.post(() -> {
+                // Add the completed text to the accumulator
+                if (!accumulatedText.isEmpty()) {
+                  accumulatedText += " " + text;
+                } else {
+                  accumulatedText = text;
+                }
 
-      JSObject ret = new JSObject();
-      ret.put("cancelled", true);
-      call.resolve(ret);
-    });
-  }
+                // Reset partial result because it has been completed
+                lastPartialResult = "";
 
+                JSObject ret = new JSObject();
+                JSArray matches = new JSArray();
+                matches.put(accumulatedText);
+                ret.put("matches", matches);
+                ret.put("status", "result");
+                notifyListeners("partialResults", ret);
+              });
+            }
+          } catch (Exception e) {
+            Logger.error(getLogTag() + " Error parsing result: " + e.getMessage());
+          }
+        }
 
-  private class SpeechRecognitionListener implements RecognitionListener {
+        @Override
+        public void onFinalResult(String hypothesis) {
+          if (hypothesis == null || hypothesis.isEmpty()) return;
 
-    private PluginCall call;
-    private boolean partialResults;
-    private boolean isInPause;
-    private final ArrayList<String> listPartialResults = new ArrayList<>();
+          try {
+            JSONObject json = new JSONObject(hypothesis);
+            String text = json.optString("text", "");
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private Runnable timeoutRunnable;
+            mainHandler.post(() -> {
+              // Also add the final result to the accumulator
+              if (!text.isEmpty()) {
+                if (!accumulatedText.isEmpty()) {
+                  accumulatedText += " " + text;
+                } else {
+                  accumulatedText = text;
+                }
+              }
 
-    public void setCall(PluginCall call) {
-      this.call = call;
-    }
+              JSObject ret = new JSObject();
+              JSArray matches = new JSArray();
+              matches.put(accumulatedText);
+              ret.put("matches", matches);
+              ret.put("status", "success");
 
-    public void setPartialResults(boolean partialResults) {
-      this.partialResults = partialResults;
-    }
+              if (call != null && !partialResults) {
+                call.resolve(ret);
+              } else {
+                notifyListeners("partialResults", ret);
+              }
+            });
+          } catch (Exception e) {
+            Logger.error(getLogTag() + " Error parsing final result: " + e.getMessage());
+          }
+        }
 
-    private String getFinalPartialResult() {
-      return String.join(" ", listPartialResults);
-    }
+        @Override
+        public void onError(Exception exception) {
+          Logger.error(getLogTag() + " Recognition error: " + exception.getMessage());
 
+          mainHandler.post(() -> {
+            if (call != null) {
+              call.reject("Recognition error: " + exception.getMessage());
+            }
 
-    @Override
-    public void onReadyForSpeech(Bundle params) {
-      Logger.debug(TAG, "Ready for speech");
-      JSObject ret = new JSObject();
-      ret.put("status", "ready");
-      notifyListeners(LISTENING_EVENT, ret);
-    }
+            JSObject ret = new JSObject();
+            ret.put("status", "error");
+            ret.put("message", exception.getMessage());
+            notifyListeners(LISTENING_EVENT, ret);
+          });
 
-    @Override
-    public void onBeginningOfSpeech() {
-      Logger.debug(TAG, "Beginning of speech");
-      getActivity().runOnUiThread(() -> {
+          stopListening();
+        }
+
+        @Override
+        public void onTimeout() {
+          Logger.info(getLogTag(), "Recognition timeout - but continuing...");
+          // With Vosk we can continue listening even after timeout
+        }
+      });
+
+      listening = true;
+
+      mainHandler.post(() -> {
         JSObject ret = new JSObject();
         ret.put("status", "started");
         notifyListeners(LISTENING_EVENT, ret);
-      });
-    }
 
-    @Override
-    public void onRmsChanged(float rmsdB) {
-    }
-
-    @Override
-    public void onBufferReceived(byte[] buffer) {
-    }
-
-    @Override
-    public void onEndOfSpeech() {
-      Logger.debug(TAG, "End of speech");
-
-      getActivity().runOnUiThread(() -> {
-        long now = new Date().getTime();
-        if (!partialResults) {
-          isListening = false;
-          JSObject ret = new JSObject();
-          ret.put("status", "stopped");
-          notifyListeners(LISTENING_EVENT, ret);
-        } else {
-          if (timeoutRunnable != null) {
-            handler.removeCallbacks(timeoutRunnable);
-          }
-
-          timeoutRunnable = () -> {
-            isListening = false;
-            JSObject ret = new JSObject();
-            ret.put("status", "stopped");
-            notifyListeners(LISTENING_EVENT, ret);
-          };
-
-          handler.postDelayed(timeoutRunnable, TIMEOUT_SPEECH);
-
+        if (partialResults && call != null) {
+          call.resolve();
         }
-
       });
 
-    }
-
-    @Override
-    public void onError(int error) {
-      isListening = false;
-      String errorMessage = getErrorMessage(error);
-      Logger.error("Speech recognition error: " + errorMessage);
-
-      JSObject errorData = new JSObject();
-      errorData.put("error", errorMessage);
-      errorData.put("code", error);
-      errorData.put("status", "error");
-      notifyListeners(LISTENING_EVENT, errorData);
-
+    } catch (Exception ex) {
+      Logger.error(getLogTag() + " Error starting recognition: " + ex.getMessage(), ex);
       if (call != null) {
-        call.reject(errorMessage);
+        call.reject(ex.getMessage());
       }
-    }
-
-    @Override
-    public void onResults(Bundle results) {
-      String finalResult = "";
-      if (isListening) {
-        ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        String lastPartialResult = getFinalPartialResult();
-
-        if (matches != null && !matches.isEmpty()) {
-          finalResult = matches.get(0);
-        } else if (!lastPartialResult.isEmpty()) {
-          finalResult = lastPartialResult;
-        }
-      }
-
-      JSArray jsArray = new JSArray();
-      jsArray.put(finalResult);
-      JSObject ret = new JSObject();
-      ret.put("matches", jsArray);
-
-      if (partialResults) {
-        notifyListeners("partialResults", ret);
-      } else if (call != null) {
-        call.resolve(ret);
-      }
-
-      isListening = false;
-    }
-
-    @Override
-    public void onPartialResults(Bundle partialResults) {
-      ArrayList<String> partialMatches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-      if (partialMatches != null && !partialMatches.isEmpty()) {
-        //noinspection SequencedCollectionMethodCanBeUsed
-        String firstMatch = partialMatches.get(0);
-        if (firstMatch.isEmpty()) {
-          isInPause = true;
-          return;
-        }
-
-        if (isInPause) {
-          isInPause = false;
-          listPartialResults.add(firstMatch);
-        } else {
-          int index = listPartialResults.isEmpty() ? 0 : listPartialResults.size() - 1;
-          listPartialResults.set(index, firstMatch);
-        }
-
-        String partialResult = getFinalPartialResult();
-
-        JSObject ret = new JSObject();
-        JSArray matches = new JSArray();
-        matches.put(partialResult);
-        ret.put("matches", matches);
-        notifyListeners("partialResults", ret);
-      }
-    }
-
-    @Override
-    public void onEvent(int eventType, Bundle params) {
+    } finally {
+      lock.unlock();
     }
   }
 
-  private String getErrorMessage(int error) {
-    return switch (error) {
-      case SpeechRecognizer.ERROR_AUDIO -> "Audio recording error";
-      case SpeechRecognizer.ERROR_CLIENT -> "Client side error";
-      case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions";
-      case SpeechRecognizer.ERROR_NETWORK -> "Network error";
-      case SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout";
-      case SpeechRecognizer.ERROR_NO_MATCH -> "No match";
-      case SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognition service busy";
-      case SpeechRecognizer.ERROR_SERVER -> "Server error";
-      case SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input";
-      default -> "Didn't understand, please try again.";
-    };
+  private void stopListening() {
+    try {
+      lock.lock();
+
+      if (listening && speechService != null) {
+        speechService.stop();
+        listening = false;
+        lastPartialResult = "";
+        // Don't reset accumulatedText here, so the last text remains available
+
+        mainHandler.post(() -> {
+          JSObject ret = new JSObject();
+          ret.put("status", "stopped");
+          notifyListeners(LISTENING_EVENT, ret);
+        });
+      }
+    } catch (Exception ex) {
+      Logger.error(getLogTag() + " Error stopping recognition: " + ex.getMessage());
+    } finally {
+      lock.unlock();
+    }
   }
 
   @Override
   protected void handleOnDestroy() {
-    super.handleOnDestroy();
-    getActivity().runOnUiThread(() -> {
-      if (speechRecognizer != null) {
-        speechRecognizer.stopListening();
-        speechRecognizer.destroy();
-        speechRecognizer = null;
+    if (speechService != null) {
+      speechService.stop();
+      speechService.shutdown();
+      speechService = null;
+    }
+
+    // Release the models
+    for (Model model : models.values()) {
+      try {
+        model.close();
+      } catch (Exception e) {
+        Logger.error(getLogTag() + " Error closing model: " + e.getMessage());
       }
-    });
+    }
+    models.clear();
+
+    super.handleOnDestroy();
   }
 }
