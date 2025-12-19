@@ -62,3 +62,5 @@ captures
 
 # VSCode
 .vscode/settings.json
+
+/*.tgz
